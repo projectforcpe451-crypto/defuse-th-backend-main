@@ -1,7 +1,14 @@
 const express = require('express');
 const router = express.Router();
 
-const priceCache = {};
+const CS2_APP_ID = 730;
+const CS2_CONTEXT_ID = 2;
+
+// ─────────────────────────────
+// ✅ CACHE (มี expire)
+// ─────────────────────────────
+const priceCache = new Map();
+const CACHE_TTL = 60 * 1000; // 1 นาที
 
 const fetchPrice = async (marketHashName) => {
   try {
@@ -16,26 +23,37 @@ const fetchPrice = async (marketHashName) => {
       );
     }
   } catch (err) {
-    console.log("❌ price error:", err.message);
+    // ❌ ตัด log ทิ้งเพื่อลด spam
   }
 
   return 0;
 };
 
-
 const fetchPriceCached = async (name) => {
-  if (priceCache[name]) return priceCache[name];
+  const cached = priceCache.get(name);
+
+  if (cached && Date.now() - cached.time < CACHE_TTL) {
+    return cached.price;
+  }
 
   const price = await fetchPrice(name);
-  priceCache[name] = price;
+
+  priceCache.set(name, {
+    price,
+    time: Date.now(),
+  });
 
   return price;
 };
 
-const CS2_APP_ID = 730;
-const CS2_CONTEXT_ID = 2;
+// ─────────────────────────────
+// CONFIG
+// ─────────────────────────────
+const MAX_PRICE_ITEMS = 20; // 🔥 จำกัดจำนวน item ที่ดึงราคา
 
-// แปลง Steam tag → rarity color
+// ─────────────────────────────
+// STATIC MAP
+// ─────────────────────────────
 const RARITY_COLORS = {
   'Consumer Grade': '#B0C3D9',
   'Industrial Grade': '#5E98D9',
@@ -56,12 +74,15 @@ const WEAR_MAP = {
   'Battle-Scarred': 'BS',
 };
 
-// แปลง description → item object
+// ─────────────────────────────
+// PARSE ITEM
+// ─────────────────────────────
 const parseItem = (asset, description) => {
   if (!description) return null;
 
   const tags = description.tags || [];
-  const getTag = (cat) => tags.find(t => t.category === cat)?.localized_tag_name || null;
+  const getTag = (cat) =>
+    tags.find(t => t.category === cat)?.localized_tag_name || null;
 
   const rarity = getTag('Rarity') || 'Base Grade';
   const wear = getTag('Exterior');
@@ -80,11 +101,10 @@ const parseItem = (asset, description) => {
     ? `https://community.cloudflare.steamstatic.com/economy/image/${description.icon_url}/360fx360f`
     : null;
 
-  // หมวดหมู่
   let category = 'Guns';
   if (name.includes('Gloves') || name.includes('Wraps')) category = 'Glove';
-  else if (['Knife', 'Karambit', 'Bayonet', 'Butterfly', 'Falchion', 'Flip', 'Gut ', 'Huntsman', 'M9 ', 'Navaja', 'Shadow', 'Stiletto', 'Talon', 'Ursus'].some(k => name.includes(k))) category = 'Knife';
-  else if (['Case', 'Capsule', 'Package', 'Sticker', 'Graffiti', 'Patch', 'Music Kit'].some(k => name.includes(k))) category = 'Cases';
+  else if (['Knife','Karambit','Bayonet','Butterfly','Falchion','Flip','Gut ','Huntsman','M9 ','Navaja','Shadow','Stiletto','Talon','Ursus'].some(k => name.includes(k))) category = 'Knife';
+  else if (['Case','Capsule','Package','Sticker','Graffiti','Patch','Music Kit'].some(k => name.includes(k))) category = 'Cases';
 
   return {
     id: asset.assetid,
@@ -93,29 +113,36 @@ const parseItem = (asset, description) => {
 
     name,
     marketHashName: description.market_hash_name,
+
     weapon,
     skin,
     rarity,
     rarityColor: RARITY_COLORS[rarity] || '#B0C3D9',
+
     wear: wear || null,
     wearShort: wear ? (WEAR_MAP[wear] || wear) : null,
+
     price: 0,
     priceUSD: 0,
     float: null,
+
     image: imageUrl,
     category,
     type,
+
     tradeLock: description.tradable === 0,
     marketable: description.marketable === 1,
     inInventory: true,
+
     stattrak: isStatTrak,
     souvenir: isSouvenir,
     tags,
   };
 };
 
-// ── GET /inventory/:steamId ───────────────────────────
-// ดึง CS2 Inventory จาก Steam (Inventory ต้องเป็น Public)
+// ─────────────────────────────
+// GET INVENTORY
+// ─────────────────────────────
 router.get('/:steamId', async (req, res) => {
   const { steamId } = req.params;
   const count = req.query.count || 100;
@@ -131,53 +158,32 @@ router.get('/:steamId', async (req, res) => {
       headers: { 'Accept': 'application/json' },
     });
 
-    if (response.status === 403) {
-      return res.status(403).json({
-        error: 'PRIVATE_INVENTORY',
-        message: 'Inventory ถูกตั้งเป็น Private กรุณาเข้า Steam → Privacy Settings → ตั้ง Inventory เป็น Public',
-      });
-    }
-
-    if (response.status === 429) {
-      return res.status(429).json({
-        error: 'RATE_LIMITED',
-        message: 'Steam API rate limit กรุณารอ 1 นาทีแล้วลองใหม่',
-      });
-    }
-
     if (!response.ok) {
-      return res.status(response.status).json({ error: `Steam API error: ${response.status}` });
+      return res.status(response.status).json({ error: `Steam API error` });
     }
 
     const data = await response.json();
 
     if (!data.assets || !data.descriptions) {
-      return res.json({ items: [], total: 0, message: 'ไม่พบ CS2 items' });
+      return res.json({ items: [], total: 0 });
     }
 
-    // Map classid → description
     const descMap = {};
     data.descriptions.forEach(d => { descMap[d.classid] = d; });
 
-    // แปลง items
-    const items = await Promise.all(
-      data.assets.map(async (asset) => {
-        const item = parseItem(asset, descMap[asset.classid]);
-        if (!item) return null;
+    let items = data.assets
+      .map(asset => parseItem(asset, descMap[asset.classid]))
+      .filter(Boolean);
 
-        // 🔥 ดึงราคาจาก Steam
-        await new Promise(r => setTimeout(r, 200));
+    // 🔥 จำกัดจำนวน item ที่ดึงราคา
+    const priceTargets = items.slice(0, MAX_PRICE_ITEMS);
+
+    // 🔥 ยิงราคาแบบ parallel (เร็วกว่า delay)
+    await Promise.all(
+      priceTargets.map(async (item) => {
         const priceUSD = await fetchPriceCached(item.marketHashName);
-        console.log("PRICE:", item.marketHashName, priceUSD);
-
-        // แปลงเป็นบาท
-        const priceTHB = Math.round(priceUSD * 35);
-
-        return {
-          ...item,
-          priceUSD,
-          price: priceTHB,
-        };
+        item.priceUSD = priceUSD;
+        item.price = Math.round(priceUSD * 35);
       })
     );
 
@@ -189,37 +195,24 @@ router.get('/:steamId', async (req, res) => {
     });
 
   } catch (err) {
-    res.status(500).json({ error: 'ไม่สามารถดึงข้อมูลได้: ' + err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /inventory/price/:marketHashName ──────────────
-// ดึงราคาจาก Steam Market
+// ─────────────────────────────
+// GET PRICE (ใช้หน้า detail)
+// ─────────────────────────────
 router.get('/price/:marketHashName', async (req, res) => {
   const name = decodeURIComponent(req.params.marketHashName);
-  const url = `https://steamcommunity.com/market/priceoverview/?appid=730&currency=1&market_hash_name=${encodeURIComponent(name)}`;
 
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
+  const priceUSD = await fetchPriceCached(name);
 
-    if (data.success) {
-      const usdPrice = parseFloat(data.median_price?.replace(/[^0-9.]/g, '') || '0');
-      res.json({
-        success: true,
-        name,
-        usd: usdPrice,
-        thb: Math.round(usdPrice * 35),
-        lowest: data.lowest_price || null,
-        median: data.median_price || null,
-        volume: data.volume || '0',
-      });
-    } else {
-      res.json({ success: false, name, usd: 0, thb: 0 });
-    }
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json({
+    success: true,
+    name,
+    usd: priceUSD,
+    thb: Math.round(priceUSD * 35),
+  });
 });
 
 module.exports = router;
