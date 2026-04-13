@@ -90,7 +90,9 @@ const parseItem = (asset, description) => {
     id: asset.assetid,
     assetId: asset.assetid,
     classId: asset.classid,
+
     name,
+    marketHashName: description.market_hash_name,
     weapon,
     skin,
     rarity,
@@ -165,7 +167,8 @@ router.get('/:steamId', async (req, res) => {
 
         // 🔥 ดึงราคาจาก Steam
         await new Promise(r => setTimeout(r, 200));
-        const priceUSD = await fetchPriceCached(item.name);
+        const priceUSD = await fetchPriceCached(item.marketHashName);
+        console.log("PRICE:", item.marketHashName, priceUSD);
 
         // แปลงเป็นบาท
         const priceTHB = Math.round(priceUSD * 35);
