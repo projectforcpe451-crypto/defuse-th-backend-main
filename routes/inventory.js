@@ -1,56 +1,46 @@
 const express = require('express');
-const cache = {};
-const CACHE_TTL = 60 * 1000; // 1 นาที
 const router = express.Router();
 
 const CS2_APP_ID = 730;
 const CS2_CONTEXT_ID = 2;
 
-// ─────────────────────────────────────────────
-// RARITY COLOR
-// ─────────────────────────────────────────────
+// แปลง Steam tag → rarity color
 const RARITY_COLORS = {
-  'Consumer Grade':   '#B0C3D9',
+  'Consumer Grade': '#B0C3D9',
   'Industrial Grade': '#5E98D9',
-  'Mil-Spec Grade':   '#4B69FF',
-  'Restricted':       '#8847FF',
-  'Classified':       '#D32CE6',
-  'Covert':           '#EB4B4B',
-  'Contraband':       '#E4AE33',
-  'Extraordinary':    '#E4AE33',
-  'Base Grade':       '#B0C3D9',
+  'Mil-Spec Grade': '#4B69FF',
+  'Restricted': '#8847FF',
+  'Classified': '#D32CE6',
+  'Covert': '#EB4B4B',
+  'Contraband': '#E4AE33',
+  'Extraordinary': '#E4AE33',
+  'Base Grade': '#B0C3D9',
 };
 
 const WEAR_MAP = {
-  'Factory New':    'FN',
-  'Minimal Wear':   'MW',
-  'Field-Tested':   'FT',
-  'Well-Worn':      'WW',
+  'Factory New': 'FN',
+  'Minimal Wear': 'MW',
+  'Field-Tested': 'FT',
+  'Well-Worn': 'WW',
   'Battle-Scarred': 'BS',
 };
 
-// ─────────────────────────────────────────────
-// PARSE ITEM
-// ─────────────────────────────────────────────
+// แปลง description → item object
 const parseItem = (asset, description) => {
   if (!description) return null;
 
   const tags = description.tags || [];
-  const getTag = (cat) =>
-    tags.find(t => t.category === cat)?.localized_tag_name || null;
+  const getTag = (cat) => tags.find(t => t.category === cat)?.localized_tag_name || null;
 
-  const rarity  = getTag('Rarity') || 'Base Grade';
-  const wear    = getTag('Exterior');
-  const type    = getTag('Weapon') || getTag('Type') || 'Unknown';
-  const collection = getTag('Collection');
-
+  const rarity = getTag('Rarity') || 'Base Grade';
+  const wear = getTag('Exterior');
+  const type = getTag('Weapon') || getTag('Type') || 'Unknown';
   const name = description.market_hash_name || description.name || 'Unknown';
 
-  // แยกชื่อ
-  const parts   = name.split(' | ');
-  const weapon  = parts[0]?.replace('StatTrak™ ', '').replace('Souvenir ', '').trim() || name;
+  const parts = name.split(' | ');
+  const weapon = parts[0]?.replace('StatTrak™ ', '').replace('Souvenir ', '').trim() || name;
   const skinRaw = parts[1] || '';
-  const skin    = skinRaw.replace(/\s*\(.*\)/, '').trim() || name;
+  const skin = skinRaw.replace(/\s*\(.*\)/, '').trim() || name;
 
   const isStatTrak = name.includes('StatTrak™');
   const isSouvenir = name.includes('Souvenir');
@@ -59,76 +49,40 @@ const parseItem = (asset, description) => {
     ? `https://community.cloudflare.steamstatic.com/economy/image/${description.icon_url}/360fx360f`
     : null;
 
-  // 🔥 INSPECT LINK (สำคัญมากสำหรับ float)
-  let inspectLink = null;
-  if (description.actions && description.actions.length > 0) {
-    inspectLink = description.actions[0].link
-      ?.replace('%owner_steamid%', asset.owner)
-      ?.replace('%assetid%', asset.assetid);
-  }
-
-  // 🎯 Stickers (optional)
-  const stickers = description.descriptions
-    ?.filter(d => d.value?.includes('Sticker:'))
-    ?.map(d => d.value) || [];
-
   // หมวดหมู่
   let category = 'Guns';
   if (name.includes('Gloves') || name.includes('Wraps')) category = 'Glove';
-  else if (
-    ['Knife','Karambit','Bayonet','Butterfly','Falchion','Flip','Gut ','Huntsman','M9 ','Navaja','Shadow','Stiletto','Talon','Ursus']
-      .some(k => name.includes(k))
-  ) category = 'Knife';
-  else if (
-    ['Case','Capsule','Package','Sticker','Graffiti','Patch','Music Kit']
-      .some(k => name.includes(k))
-  ) category = 'Cases';
+  else if (['Knife', 'Karambit', 'Bayonet', 'Butterfly', 'Falchion', 'Flip', 'Gut ', 'Huntsman', 'M9 ', 'Navaja', 'Shadow', 'Stiletto', 'Talon', 'Ursus'].some(k => name.includes(k))) category = 'Knife';
+  else if (['Case', 'Capsule', 'Package', 'Sticker', 'Graffiti', 'Patch', 'Music Kit'].some(k => name.includes(k))) category = 'Cases';
 
   return {
     id: asset.assetid,
     assetId: asset.assetid,
     classId: asset.classid,
-
     name,
     weapon,
     skin,
-
     rarity,
     rarityColor: RARITY_COLORS[rarity] || '#B0C3D9',
-
     wear: wear || null,
     wearShort: wear ? (WEAR_MAP[wear] || wear) : null,
-
-    // 🔥 เตรียมสำหรับ float API
-    float: null,
-    inspectLink,
-
-    // เพิ่ม metadata
-    collection,
-    stickers,
-
     price: 0,
     priceUSD: 0,
-
+    float: null,
     image: imageUrl,
-
     category,
     type,
-
     tradeLock: description.tradable === 0,
     marketable: description.marketable === 1,
     inInventory: true,
-
     stattrak: isStatTrak,
     souvenir: isSouvenir,
-
     tags,
   };
 };
 
-// ─────────────────────────────────────────────
-// GET INVENTORY
-// ─────────────────────────────────────────────
+// ── GET /inventory/:steamId ───────────────────────────
+// ดึง CS2 Inventory จาก Steam (Inventory ต้องเป็น Public)
 router.get('/:steamId', async (req, res) => {
   const { steamId } = req.params;
   const count = req.query.count || 100;
@@ -147,35 +101,32 @@ router.get('/:steamId', async (req, res) => {
     if (response.status === 403) {
       return res.status(403).json({
         error: 'PRIVATE_INVENTORY',
-        message: 'Inventory ต้องเป็น Public',
+        message: 'Inventory ถูกตั้งเป็น Private กรุณาเข้า Steam → Privacy Settings → ตั้ง Inventory เป็น Public',
       });
     }
 
     if (response.status === 429) {
       return res.status(429).json({
         error: 'RATE_LIMITED',
-        message: 'โดน rate limit',
+        message: 'Steam API rate limit กรุณารอ 1 นาทีแล้วลองใหม่',
       });
     }
 
     if (!response.ok) {
-      return res.status(response.status).json({
-        error: `Steam API error: ${response.status}`,
-      });
+      return res.status(response.status).json({ error: `Steam API error: ${response.status}` });
     }
 
     const data = await response.json();
 
     if (!data.assets || !data.descriptions) {
-      return res.json({ items: [], total: 0 });
+      return res.json({ items: [], total: 0, message: 'ไม่พบ CS2 items' });
     }
 
-    // map classid → description
+    // Map classid → description
     const descMap = {};
-    data.descriptions.forEach(d => {
-      descMap[d.classid] = d;
-    });
+    data.descriptions.forEach(d => { descMap[d.classid] = d; });
 
+    // แปลง items
     const items = data.assets
       .map(asset => parseItem(asset, descMap[asset.classid]))
       .filter(Boolean);
@@ -188,48 +139,55 @@ router.get('/:steamId', async (req, res) => {
     });
 
   } catch (err) {
-    res.status(500).json({
-      error: 'Fetch failed: ' + err.message,
-    });
+    res.status(500).json({ error: 'ไม่สามารถดึงข้อมูลได้: ' + err.message });
   }
 });
 
-// ─────────────────────────────────────────────
-// GET PRICE
-// ─────────────────────────────────────────────
+// ── GET /inventory/price/:marketHashName ──────────────
+// ดึงราคาจาก Steam Market
 router.get('/price/:marketHashName', async (req, res) => {
   const name = decodeURIComponent(req.params.marketHashName);
-
   const url = `https://steamcommunity.com/market/priceoverview/?appid=730&currency=1&market_hash_name=${encodeURIComponent(name)}`;
 
   try {
-    const response = await fetch(url);
-    const data = await response.json();
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0',
+        'Accept': 'application/json',
+      },
+    });
+
+    const text = await response.text();
+
+    if (text.startsWith('<')) {
+      console.log("❌ Steam BLOCKED:", name);
+      return res.json({ success: false, name, usd: 0, thb: 0 });
+    }
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return res.json({ success: false, name, usd: 0, thb: 0 });
+    }
 
     if (data.success) {
       const usdPrice = parseFloat(
         data.median_price?.replace(/[^0-9.]/g, '') || '0'
       );
 
-      res.json({
+      return res.json({
         success: true,
         name,
         usd: usdPrice,
         thb: Math.round(usdPrice * 35),
-        lowest: data.lowest_price || null,
-        median: data.median_price || null,
-        volume: data.volume || '0',
-      });
-    } else {
-      res.json({
-        success: false,
-        name,
-        usd: 0,
-        thb: 0,
       });
     }
+
+    return res.json({ success: false, name, usd: 0, thb: 0 });
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 });
 
