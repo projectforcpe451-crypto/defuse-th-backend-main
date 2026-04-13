@@ -1,6 +1,37 @@
 const express = require('express');
 const router = express.Router();
 
+const priceCache = {};
+
+const fetchPrice = async (marketHashName) => {
+  try {
+    const url = `https://steamcommunity.com/market/priceoverview/?appid=730&currency=1&market_hash_name=${encodeURIComponent(marketHashName)}`;
+
+    const res = await fetch(url);
+    const data = await res.json();
+
+    if (data.success) {
+      return parseFloat(
+        data.median_price?.replace(/[^0-9.]/g, '') || "0"
+      );
+    }
+  } catch (err) {
+    console.log("❌ price error:", err.message);
+  }
+
+  return 0;
+};
+
+
+const fetchPriceCached = async (name) => {
+  if (priceCache[name]) return priceCache[name];
+
+  const price = await fetchPrice(name);
+  priceCache[name] = price;
+
+  return price;
+};
+
 const CS2_APP_ID = 730;
 const CS2_CONTEXT_ID = 2;
 
@@ -127,9 +158,25 @@ router.get('/:steamId', async (req, res) => {
     data.descriptions.forEach(d => { descMap[d.classid] = d; });
 
     // แปลง items
-    const items = data.assets
-      .map(asset => parseItem(asset, descMap[asset.classid]))
-      .filter(Boolean);
+    const items = await Promise.all(
+      data.assets.map(async (asset) => {
+        const item = parseItem(asset, descMap[asset.classid]);
+        if (!item) return null;
+
+        // 🔥 ดึงราคาจาก Steam
+        await new Promise(r => setTimeout(r, 200));
+        const priceUSD = await fetchPriceCached(item.name);
+
+        // แปลงเป็นบาท
+        const priceTHB = Math.round(priceUSD * 35);
+
+        return {
+          ...item,
+          priceUSD,
+          price: priceTHB,
+        };
+      })
+    );
 
     res.json({
       success: true,
@@ -150,44 +197,25 @@ router.get('/price/:marketHashName', async (req, res) => {
   const url = `https://steamcommunity.com/market/priceoverview/?appid=730&currency=1&market_hash_name=${encodeURIComponent(name)}`;
 
   try {
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'application/json',
-      },
-    });
-
-    const text = await response.text();
-
-    if (text.startsWith('<')) {
-      console.log("❌ Steam BLOCKED:", name);
-      return res.json({ success: false, name, usd: 0, thb: 0 });
-    }
-
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return res.json({ success: false, name, usd: 0, thb: 0 });
-    }
+    const response = await fetch(url);
+    const data = await response.json();
 
     if (data.success) {
-      const usdPrice = parseFloat(
-        data.median_price?.replace(/[^0-9.]/g, '') || '0'
-      );
-
-      return res.json({
+      const usdPrice = parseFloat(data.median_price?.replace(/[^0-9.]/g, '') || '0');
+      res.json({
         success: true,
         name,
         usd: usdPrice,
         thb: Math.round(usdPrice * 35),
+        lowest: data.lowest_price || null,
+        median: data.median_price || null,
+        volume: data.volume || '0',
       });
+    } else {
+      res.json({ success: false, name, usd: 0, thb: 0 });
     }
-
-    return res.json({ success: false, name, usd: 0, thb: 0 });
-
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
